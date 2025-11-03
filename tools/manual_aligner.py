@@ -5,48 +5,13 @@ import cv2
 import tkinter as tk
 
 from config import ORIGINAL_DATA_DIR, ALIGNED_DATA_DIR, TARGET_IMAGE_FORMAT
+from utils.file_utils import find_images_recursive
+from utils.system_utils import get_screen_size
 
 # Key codes for keyboard inputs
 KEY_ESC = 27
 KEY_ENTER = 13
 KEY_SPACE = 32
-
-
-def get_screen_size():
-    """
-    Get the screen size using tkinter.
-    :return: (width, height)
-    """
-    root = tk.Tk()
-    root.withdraw()  # Hide the main window
-    width = root.winfo_screenwidth()
-    height = root.winfo_screenheight()
-    root.destroy()
-    return width, height
-
-
-def find_images_recursive(root_dir: Path) -> List[Path]:
-    """
-    Recursively find all image files in the given directory,
-    and return a sorted list of their absolute paths.
-    :param root_dir: The root directory to search for images.
-    :return: A sorted list of absolute paths to image files.
-    """
-    if not root_dir.is_absolute():
-        raise ValueError("The provided path must be absolute.")
-    if not root_dir.is_dir():
-        raise ValueError("The provided path must be a directory.")
-    print(f"Getting all image paths from {root_dir}")
-
-    supported_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
-    all_image_paths = []
-
-    for file_path in root_dir.rglob('*'):
-        if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
-            all_image_paths.append(file_path)
-
-    all_image_paths.sort()
-    return all_image_paths
 
 
 def main():

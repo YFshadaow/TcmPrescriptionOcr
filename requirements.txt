@@ -1,1 +1,6 @@
-opencv-python
+opencv-python~=4.12.0.88
+numpy~=2.2.6
+numba~=0.62.1
+scikit-image~=0.25.2
+matplotlib~=3.10.7
+tqdm~=4.67.1

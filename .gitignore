@@ -1,6 +1,9 @@
 # Prescription image files
 /data/
 
+# Test directory
+/test/
+
 
 
 

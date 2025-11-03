@@ -8,6 +8,10 @@ DATA_DIR = PROJECT_ROOT / 'data'
 ORIGINAL_DATA_DIR = DATA_DIR / 'original'
 # Directory to store aligned prescription files (oblique images corrected)
 ALIGNED_DATA_DIR = DATA_DIR / 'aligned'
+# Directory to store greyscale prescription files
+GREYSCALE_DATA_DIR = DATA_DIR / 'greyscale'
 
 # Target image file format
 TARGET_IMAGE_FORMAT = '.png'
+
+# Preprocessing parameters
