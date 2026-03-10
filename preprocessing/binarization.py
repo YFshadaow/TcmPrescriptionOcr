@@ -1,3 +1,4 @@
+import math
 from typing import Literal
 
 import cv2
@@ -107,3 +108,27 @@ def sauvola_threshold(
     binary_image = image > thresh_sauvola
     uint8_image = binary_image.astype(np.uint8) * 255
     return uint8_image
+
+
+def sauvola_for_unwarping(
+        grey_image: np.ndarray
+) -> np.ndarray:
+    """
+    Used a set of fixed parameters for Sauvola's thresholding for unwarping.
+    The window size is set to 1/20 of the shorter side of the image, and k is set to 0.2.
+    :param grey_image: Input greyscale image as a 2D numpy array.
+    :return: Binary image as a 2D numpy array.
+    """
+    height, width = grey_image.shape
+    shorter_side = min(width, height)
+    # Ensure the window size is odd
+    window_size = math.ceil(shorter_side / 20) | 1
+    if window_size < 3:
+        raise ValueError(
+            f"Calculated window size {window_size} is too small for image with dimensions ({width}, {height}).")
+
+    return sauvola_threshold(
+        image=grey_image,
+        window_size=window_size,
+        k=0.2
+    )

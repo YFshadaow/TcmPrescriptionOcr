@@ -1,24 +1,37 @@
+import itertools
+import math
+import os
+import time
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 from numba import jit
 import skimage as ski
+from scipy.interpolate import CubicSpline
 
-from preprocessing.binarization import sauvola_threshold
+from config import UNWARPED_DATA_DIR, GREYSCALE_DATA_DIR
+from preprocessing.binarization import sauvola_threshold, sauvola_for_unwarping
+from utils.file_utils import find_images_recursive
 from utils.system_utils import get_screen_size
 
-# The ratio coordinates of the target area in the dewarped image
+paper_aspect_ratio = 997.0 / 1432.0
+
+# The ratio coordinates of the target area in the unwarped image
 target_x_min_ratio = 0.063190
 target_x_max_ratio = 0.925778
 # Ensure target_y is in increasing order
 target_y_ratios = [0.208799, 0.256983, 0.335894, 0.907123]
 
+# This is the ratio of the vertical distance between each pair of adjacent lines to the total vertical distance of the target area.
+target_section_ratios = []
+for i in range(len(target_y_ratios) - 1):
+    ratio = (target_y_ratios[i+1] - target_y_ratios[i]) / (target_y_ratios[-1] - target_y_ratios[0])
+    target_section_ratios.append(ratio)
+
 POINTS_PER_100_PIXELS = 0.7
 MIN_POINTS_PER_LINE = 5
 MAX_POINTS_PER_LINE = 9
-
-
 
 target_width_ratio = target_x_max_ratio - target_x_min_ratio
 target_height_ratio = target_y_ratios[-1] - target_y_ratios[0]
@@ -142,16 +155,56 @@ def path_finding_find_path(binary_image: np.ndarray) -> np.ndarray:
     return path
 
 
+@jit(nopython=True)
+def find_endpoints_core(
+        binary_image: np.ndarray,
+        path: np.ndarray,
+        center_x: int,
+        break_tolerance: int = 10
+) -> Tuple[int, int]:
+    """
+    Find the left and right endpoints of the path found by the path_finding algorithm,
+    using a break tolerance to determine where the path likely ends.
+    :param binary_image: The original binary image as a numpy array.
+    :param path: The path as a 1D numpy array of y-coordinates for each x-coordinate.
+    :param center_x: The x-coordinate of the center of the path, used as a starting point for searching endpoints.
+    :param break_tolerance: The number of consecutive background pixels required to consider the path ended.
+    :return: A tuple of (left_endpoint_x, right_endpoint_x) representing the x-coordinates of the left and right endpoints of the path.
+    """
+    width = len(path)
+    left_endpoint_x = 0
+    background_count = 0
+    for x in range(center_x, -1, -1):
+        if binary_image[path[x], x] == 255:
+            background_count += 1
+        else:
+            background_count = 0
+        if background_count >= break_tolerance:
+            left_endpoint_x = x + break_tolerance
+            break
+
+    right_endpoint_x = width - 1
+    background_count = 0
+    for x in range(center_x, width):
+        if binary_image[path[x], x] == 255:
+            background_count += 1
+        else:
+            background_count = 0
+        if background_count >= break_tolerance:
+            right_endpoint_x = x - break_tolerance
+            break
+
+    return left_endpoint_x, right_endpoint_x
+
+
 def find_reference_line(
         binary_image: np.ndarray,
         path: np.ndarray,
-        break_tolerance: int = 10
 ) -> np.ndarray:
     """
     Find the left and right endpoints of the path found by the path_finding algorithm.
     :param binary_image: 2D binary image as a numpy array.
     :param path: 1D numpy array of y-coordinates representing the path.
-    :param break_tolerance: Number of consecutive background pixels to consider as a break.
     :return: List of (y, x) tuples representing the trimmed path.
     """
     width = len(path)
@@ -160,31 +213,7 @@ def find_reference_line(
 
     center_x = width // 2
 
-    # Find left endpoint
-    left_endpoint_x = 0  # Default to the very beginning of the image
-    background_count = 0
-    for x in range(center_x, -1, -1):
-        if binary_image[path[x], x] == 255:  # Background pixel
-            background_count += 1
-        else:
-            background_count = 0  # Reset on foreground pixel
-
-        if background_count >= break_tolerance:
-            left_endpoint_x = x + break_tolerance
-            break
-
-    # Find right endpoint
-    right_endpoint_x = width - 1  # Default to the very end of the image
-    background_count = 0
-    for x in range(center_x, width):
-        if binary_image[path[x], x] == 255:  # Background pixel
-            background_count += 1
-        else:
-            background_count = 0  # Reset on foreground pixel
-
-        if background_count >= break_tolerance:
-            right_endpoint_x = x - break_tolerance
-            break
+    left_endpoint_x, right_endpoint_x = find_endpoints_core(binary_image, path, center_x)
 
     # Create path if valid
     if left_endpoint_x > right_endpoint_x:
@@ -198,6 +227,25 @@ def find_reference_line(
     # Stack them together into an (N, 2) array
     trimmed_path = np.stack((y_coords, x_coords), axis=1)
     return trimmed_path
+
+
+@jit(nopython=True)
+def erase_path_core(image: np.ndarray, path: np.ndarray, y_erase_radius: int):
+    """
+        Erase the path from the binary image by setting pixels to white (255) in a vertical radius around the path.
+    :param image: 2D binary image as a numpy array, which will be modified in place.
+    :param path: 1D numpy array of y-coordinates representing the path to be erased.
+    :param y_erase_radius: The vertical radius around the path to be erased. For each x-coordinate, pixels from (y - y_erase_radius) to (y + y_erase_radius) will be set to 255.
+    :return:
+    """
+    height, width = image.shape
+    for x in range(width):
+        y_center = path[x]
+        # Iterate through the vertical radius
+        for dy in range(-y_erase_radius, y_erase_radius + 1):
+            y = y_center + dy
+            if 0 <= y < height:
+                image[y, x] = 255
 
 
 def erase_path(
@@ -226,36 +274,18 @@ def erase_path(
     # Create copy of the image to modify
     modified_image = binary_image.copy()
 
-    # Create an array of all x-coordinates
-    x_coords = np.arange(width)
-
-    # Create a 2D grid of y-coordinates for the erase region around the path.
-    # This creates a (2 * y_erase_radius + 1, width) array.
-    # Each column `j` contains [path[j]-r, path[j]-r+1, ..., path[j]+r]
-    y_offsets = np.arange(-y_erase_radius, y_erase_radius + 1)
-    y_coords_grid = path + y_offsets[:, np.newaxis]
-
-    # Clip the y-coordinates to be within the image bounds [0, height-1]
-    np.clip(y_coords_grid, 0, height - 1, out=y_coords_grid)
-
-    # Use the calculated x and y coordinates to set pixels to white (255).
-    # This advanced indexing operation is highly efficient.
-    modified_image[y_coords_grid, x_coords] = 255
+    erase_path_core(modified_image, path, y_erase_radius)
 
     return modified_image
 
 
-def find_reference_lines(
+def find_candidate_reference_lines(
         binary_image: np.ndarray,
-        line_count : int = 4,
-        break_tolerance: int = 10,
         y_erase_radius_ratio: float = 0.015
 ) -> List[np.ndarray]:
     """
-    Find multiple reference lines in the binary image using path_finding algorithm.
+    Find multiple candidate reference lines in the binary image using path_finding algorithm.
     :param binary_image: 2D binary image as a numpy array.
-    :param line_count: Number of reference lines to find.
-    :param break_tolerance: Number of consecutive background pixels to consider as a break.
     :param y_erase_radius_ratio: Ratio of vertical erase radius to image height when erasing paths.
     :return: List of reference lines, each represented as a list of (y, x) tuples.
     """
@@ -268,10 +298,11 @@ def find_reference_lines(
     modified_image = binary_image.copy()
     reference_lines = []
 
-    for _ in range(line_count):
+    # Plus 2 because the top and bottom paper edges tend to produce low costs during path finding
+    for _ in range(len(target_y_ratios) + 2):
         path = path_finding_find_path(modified_image)
 
-        reference_line = find_reference_line(modified_image, path, break_tolerance)
+        reference_line = find_reference_line(modified_image, path)
         # Only add non-empty lines
         if reference_line.size > 0:
             reference_lines.append(reference_line)
@@ -284,11 +315,180 @@ def find_reference_lines(
     if not reference_lines:
         return []
 
-    # Assuming lines do not cross each other
-    # Sort by the y-coordinate of the first point in each line array
-    reference_lines.sort(key=lambda line_array: line_array[0, 0])
+    # Sort by lines from top to bottom based on their mean Y coordinate
+    reference_lines = sorted(reference_lines, key=lambda line: np.mean(line[:, 0]))
 
     return reference_lines
+
+
+def select_best_lines(
+        candidate_lines: List[np.ndarray],
+        y_cross_ratio_error_weight: float = 1,
+        x_collinearity_error_weight: float = 16
+) -> List[np.ndarray]:
+    """
+    Select the best reference lines from the candidate lines based on how well their vertical positions match the target_y_ratios.
+    It is assumed that exactly 4 reference lines are needed, and the candidate lines are sorted from top to bottom.
+    :param candidate_lines: List of candidate reference lines, each represented as a list of (y, x) tuples.
+    :param y_cross_ratio_error_weight: Weight for the Y-axis cross-ratio error in the total error calculation.
+    :param x_collinearity_error_weight: Weight for the X-axis collinearity error calculation.
+    :return: List of selected reference lines that best match the target_y_ratios, sorted from top to bottom.
+    """
+    candidate_line_count = len(candidate_lines)
+    target_line_count = 4
+    if candidate_line_count < target_line_count:
+        raise ValueError(f"Not enough candidate lines found. Expected at least {target_line_count}, but got {candidate_line_count}.")
+
+    # Assume the lines are already sorted from top to bottom
+    t_y1, t_y2, t_y3, t_y4 = target_y_ratios
+    target_cross_ratio = ((t_y3 - t_y1) * (t_y4 - t_y2)) / ((t_y3 - t_y2) * (t_y4 - t_y1))
+
+    y_means = [np.mean(line[:, 0]) for line in candidate_lines]
+
+    left_endpoints_x = [line[0, 1] for line in candidate_lines]
+    left_endpoints_y = [line[0, 0] for line in candidate_lines]
+    right_endpoints_x = [line[-1, 1] for line in candidate_lines]
+    right_endpoints_y = [line[-1, 0] for line in candidate_lines]
+    x_spans = [line[-1, 1] - line[0, 1] for line in candidate_lines]
+
+    best_indices = None
+    min_total_error = float('inf')
+
+    for indices in itertools.combinations(range(candidate_line_count), target_line_count):
+        selected_y_mean = [y_means[index] for index in indices]
+
+        # Firstly calculate Y-axis cross-ratio error
+        Y1, Y2, Y3, Y4 = selected_y_mean
+        denominator = ((Y3 - Y2) * (Y4 - Y1))
+        if denominator == 0:
+            continue
+        candidate_cross_ratio = ((Y3 - Y1) * (Y4 - Y2)) / denominator
+        y_cross_ratio_error = abs(candidate_cross_ratio - target_cross_ratio)
+        print(f"Testing indices {indices}: Y cross-ratio error = {y_cross_ratio_error:.6f}")
+
+        # Secondly calculate X-axis endpoint collinearity error
+        selected_x_spans = [x_spans[index] for index in indices]
+
+        mean_span = np.mean(selected_x_spans)
+        if mean_span <= 0:
+            continue
+
+        selected_left_x = [left_endpoints_x[index] for index in indices]
+        selected_left_y = [left_endpoints_y[index] for index in indices]
+        selected_right_x = [right_endpoints_x[index] for index in indices]
+        selected_right_y = [right_endpoints_y[index] for index in indices]
+
+        left_poly = np.polyfit(selected_left_y, selected_left_x, 1)
+        expected_left_x = np.polyval(left_poly, selected_left_y)
+        left_pixel_error = np.mean(np.abs(expected_left_x - selected_left_x))
+
+        right_poly = np.polyfit(selected_right_y, selected_right_x, 1)
+        expected_right_x = np.polyval(right_poly, selected_right_y)
+        right_pixel_error = np.mean(np.abs(expected_right_x - selected_right_x))
+
+        x_collinearity_error = (left_pixel_error + right_pixel_error) / 2.0 / mean_span
+        print(f"Testing indices {indices}: X collinearity error = {x_collinearity_error:.6f}")
+
+        total_error = (
+                y_cross_ratio_error_weight * y_cross_ratio_error +
+                x_collinearity_error_weight * x_collinearity_error
+        )
+
+        if total_error < min_total_error:
+            min_total_error = total_error
+            best_indices = indices
+
+    if best_indices is None:
+        raise ValueError(f"No best reference lines found.")
+
+    best_reference_lines = [candidate_lines[index] for index in best_indices]
+    print(f"Found best reference lines with indices: {best_indices} with total error: {min_total_error:.6f}")
+    return best_reference_lines
+
+
+@jit(nopython=True)
+def _ray_cast_core(
+        binary_image: np.ndarray,
+        y_coords: np.ndarray,
+        x_coords: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Core ray-casting algorithm implementation using Numba for acceleration.
+    @param binary_image: 2D binary image as a numpy array.
+    @param y_coords: 1D numpy array of y-coordinates for the points to be refined.
+    @param x_coords: 1D numpy array of x-coordinates for the points to be refined.
+    """
+    N = len(y_coords)
+    height = binary_image.shape[0]
+    top_edges = np.zeros(N, dtype=np.int32)
+    bottom_edges = np.zeros(N, dtype=np.int32)
+    thicknesses = np.zeros(N, dtype=np.int32)
+
+    for index in range(N):
+        x = x_coords[index]
+        y = y_coords[index]
+
+        # Trace up to find the real top edge of the line
+        y_up = y
+        while y_up >= 0 and binary_image[y_up, x] != 255:
+            y_up -= 1
+        # Move back 1 pixel down to the last black pixel, which is the actual top edge
+        top_edges[index] = y_up + 1
+
+        # Trace down to find the real bottom edge of the line
+        y_down = y
+        while y_down < height and binary_image[y_down, x] != 255:
+            y_down += 1
+        # Move back 1 pixel up to the last black pixel, which is the actual bottom edge
+        bottom_edges[index] = y_down - 1
+
+        # Record thickness at this x-coordinate
+        thicknesses[index] = bottom_edges[index] - top_edges[index] + 1
+
+    return top_edges, bottom_edges, thicknesses
+
+
+def center_reference_line(binary_image: np.ndarray, line_coords: np.ndarray) -> np.ndarray:
+    """
+    Refine the given line coordinates to better align with the physical center of the reference line in the binary image.
+    :param binary_image: 2D binary image as a numpy array.
+    :param line_coords: 1D numpy array of (y, x) coordinates representing the initial line to be refined.
+    :return: 1D numpy array of (y, x) coordinates representing the refined line, where the y-coordinates have been adjusted to better match the physical center of the line in the image.
+    """
+    if len(line_coords) < 2:
+        raise ValueError("Line coordinates must contain at least 2 points for refinement.")
+
+    refined_line = np.copy(line_coords)
+    y_coords = line_coords[:, 0]
+    x_coords = line_coords[:, 1]
+
+    # Ray-casting to find the actual top and bottom edges of the line at each x-coordinate, and calculate thicknesses
+    top_edges, bottom_edges, thicknesses = _ray_cast_core(binary_image, y_coords, x_coords)
+
+    # Use thickness median as a threshold to filter out points that are likely contaminated by nearby text
+    median_thickness = np.median(thicknesses)
+
+    # Only keep points where the thickness is less than or equal to the median
+    valid_mask = thicknesses <= median_thickness
+
+    if np.sum(valid_mask) < 2:
+        raise ValueError(f"At least 2 valid points are required for refinement.")
+
+    valid_x = x_coords[valid_mask]
+    valid_centers = (top_edges[valid_mask] + bottom_edges[valid_mask]) / 2.0
+
+    # Deprecated approach: it turns out that cubic spline interpolation can produce large oscillations
+    # # Fit cubic splines for valid center points (points where thickness is less than or equal to the median)
+    # cs = CubicSpline(valid_x, valid_centers, bc_type="natural")
+    # refined_y_float = cs(x_coords)
+
+    refined_y_float = np.interp(x_coords, valid_x, valid_centers)
+
+
+    # Round the refined y-coordinates to the nearest integer and update the refined line
+    refined_line[:, 0] = np.round(refined_y_float).astype(np.int32)
+
+    return refined_line
 
 
 def pad_or_crop(image: np.ndarray, top: int, bottom: int, left: int, right: int) -> np.ndarray:
@@ -404,7 +604,7 @@ def generate_control_points(
     return source_points, destination_points
 
 
-def dewarp(
+def unwarp_with_reference(
         grey_image: np.ndarray,
         reference_lines: List[np.ndarray]
 )-> np.ndarray:
@@ -417,12 +617,11 @@ def dewarp(
     # Calculate the approximate bounding box of all reference lines in the original image
     num_lines = len(reference_lines)
     assert num_lines >= 2, f"Expected at least 2 reference lines, got {num_lines}"
-    # X min = average of all lines' left endpoints
-    # X max = average of all lines' right endpoints
-    x_mins = [line[0][1] for line in reference_lines]
-    x_maxs = [line[-1][1] for line in reference_lines]
-    x_min = sum(x_mins) // num_lines
-    x_max = sum(x_maxs) // num_lines
+
+    # Find the min and max x values across all lines to determine the horizontal bounds of the bounding box
+    x_min = int(min([line[:, 1].min() for line in reference_lines]))
+    x_max = int(max([line[:, 1].max() for line in reference_lines]))
+
     # Y min = average of topmost line's y values
     # Y max = average of bottommost line's y values
     y_min = sum(p[0] for p in reference_lines[0]) // len(reference_lines[0])
@@ -440,6 +639,8 @@ def dewarp(
 
     bbox_expanded_width = x_max_expanded - x_min_expanded + 1
     bbox_expanded_height = y_max_expanded - y_min_expanded + 1
+
+    ideal_expanded_width = int(bbox_expanded_height * paper_aspect_ratio)
 
     print(f'Expanded bbox: x[{x_min_expanded}, {x_max_expanded}], y[{y_min_expanded}, {y_max_expanded}], w={bbox_expanded_width}, h={bbox_expanded_height}')
     
@@ -480,21 +681,121 @@ def dewarp(
                 "A point in one of the reference lines is out of bounds after applying the offset."
             )
 
-    source_points, destination_points = generate_control_points(reference_lines_with_offset, bbox_expanded_width, bbox_expanded_height)
+    source_points, destination_points = generate_control_points(
+        reference_lines_with_offset,
+        ideal_expanded_width,
+        bbox_expanded_height
+    )
 
-    # Do the actual dewarp
+    # Do the actual unwarp
     tps = ski.transform.ThinPlateSplineTransform()
     tps.estimate(destination_points, source_points)
+
+    out_rows, out_cols = bbox_expanded_height, ideal_expanded_width
+
+    # New approach: Instead of applying TPS to every pixel, we apply it to a sparse grid and then use fast interpolation to get the full mapping.
+
+    # Grid step, the larger the step, the faster but less accurate.
+    grid_step = 16
+    grid_h = max(2, out_rows // grid_step)
+    grid_w = max(2, out_cols // grid_step)
+
+    # Numpy trick: Use complex numbers as step size to generate equally spaced coordinates
+    r_coords, c_coords = np.mgrid[0: out_rows - 1: complex(0, grid_h),
+    0: out_cols - 1: complex(0, grid_w)]
+
+    # Flatten the grid coordinates to a list of (x, y) points for TPS input
+    out_coords_flat = np.column_stack([c_coords.ravel(), r_coords.ravel()])
+
+    # TPS calculation on the sparse grid points
+    in_coords_flat = tps(out_coords_flat)
+
+    # Construct the sparse mapping matrices for x and y
+    sparse_map_x = in_coords_flat[:, 0].reshape((grid_h, grid_w)).astype(np.float32)
+    sparse_map_y = in_coords_flat[:, 1].reshape((grid_h, grid_w)).astype(np.float32)
+
+    # Upscale the sparse mapping to the full output size using
+    map_x = cv2.resize(sparse_map_x, (out_cols, out_rows), interpolation=cv2.INTER_CUBIC)
+    map_y = cv2.resize(sparse_map_y, (out_cols, out_rows), interpolation=cv2.INTER_CUBIC)
+
+    # Use OpenCV's remap function to apply the unwarping based on the full mapping.
+    unwarped_uint8 = cv2.remap(
+        padded_image,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+    # Deprecated approach: Direct use TPS for full-resolution warping is computationally expensive and provides negligible improvement,
+    # since document deformation is very smooth, sparse TPS is already sufficiently accurate
+
     # Use cval=1 to fill out-of-bounds areas with white
-    dewarped_float = ski.transform.warp(padded_image, tps, cval=1)
-    dewarped_uint8 = np.clip(dewarped_float * 255, 0, 255).astype(np.uint8)
-    return dewarped_uint8
+    # unwarped_float = ski.transform.warp(
+    #     padded_image,
+    #     tps,
+    #     output_shape=(bbox_expanded_height, ideal_expanded_width),
+    #     order=3,
+    #     cval=1
+    # )
+    # unwarped_uint8 = np.clip(unwarped_float * 255, 0, 255).astype(np.uint8)
+
+    return unwarped_uint8
+
+
+def unwarp(grey_image: np.ndarray)-> np.ndarray:
+    """
+    Main function to unwarp the image by detecting and using reference lines.
+    :param grey_image: The input grayscale image as a numpy array.
+    :return: The unwarped image as a numpy array.
+    """
+    start_time = time.time()
+
+    # Use manually selected fixed Sauvola parameters that produce good reference lines.
+    binary_image = (sauvola_for_unwarping(grey_image))
+    t1 = time.time()
+    print(f"Sauvola thresholding: {t1 - start_time:.4f}s.")
+
+    candidate_reference_lines = find_candidate_reference_lines(binary_image)
+    t2 = time.time()
+    print(f"Reference line detection: {t2 - t1:.4f}s.")
+
+    reference_lines = select_best_lines(candidate_reference_lines)
+    t3 = time.time()
+    print(f"Best reference lines selection: {t3 - t2:.4f}s.")
+
+    centered_reference_lines = [center_reference_line(binary_image, line) for line in reference_lines]
+    t4 = time.time()
+    print(f"Reference line centering: {t4 - t3:.4f}s.")
+
+    unwarped_image = unwarp_with_reference(grey_image, centered_reference_lines)
+    t5 = time.time()
+    print(f"TPS unwarping: {t5 - t4:.4f}s.")
+    return unwarped_image
+
+
+def crop_prescription_region(unwarped_image: np.ndarray) -> np.ndarray:
+    """
+    Get the cropped prescription region from the unwarped image based on the target Y ratios.
+    :param unwarped_image: The unwarped image as a numpy array.
+    :return: Cropped prescription region as a numpy array.
+    """
+    height, width = unwarped_image.shape
+
+    # Calculate Y borders: from line 2 (index 1) to line 4 (index 3)
+    y_start = int(height * target_y_ratios[1])
+    y_end = int(height * target_y_ratios[3])
+
+
+    prescription_region = unwarped_image[y_start:y_end, :]
+
+    return prescription_region
 
 
 def run_and_visualize(image_path: str):
     """
     加载图像，找到参考线，高质量缩放并显示原始图+参考线，
-    然后调用dewarp并高质量缩放、显示校正后的图。
+    然后调用unwarp并高质量缩放、显示校正后的图。
     """
     try:
         gray_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -506,18 +807,23 @@ def run_and_visualize(image_path: str):
 
     print(f"图像 '{image_path}' 加载成功，正在寻找参考线...")
     # ... (您的处理逻辑保持不变)
-    binary_image = sauvola_threshold(gray_image, window_size=401, k=0.4)
-    reference_lines = find_reference_lines(binary_image, line_count=4)
+
+    binary_image = sauvola_for_unwarping(gray_image)
+    candidate_reference_lines = find_candidate_reference_lines(binary_image)
+    reference_lines = select_best_lines(candidate_reference_lines)
+    centered_reference_lines = [center_reference_line(binary_image, line) for line in reference_lines]
 
     print("参考线寻找完成！正在进行图像校正...")
-    dewarped_image = dewarp(gray_image, reference_lines)
+    unwarped_image = unwarp_with_reference(gray_image, centered_reference_lines)
     print("图像校正完成！")
+
+    prescription_region = crop_prescription_region(unwarped_image)
 
     # --- 第一部分：高质量显示原始图像 + 参考线 ---
     image_with_lines = cv2.cvtColor(gray_image, cv2.COLOR_GRAY2BGR)
     colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
 
-    for i, ref_line in enumerate(reference_lines):
+    for i, ref_line in enumerate(centered_reference_lines):
         color = colors[i % len(colors)]
         for j in range(1, len(ref_line)):
             pt1 = (int(ref_line[j - 1][1]), int(ref_line[j - 1][0]))
@@ -547,34 +853,81 @@ def run_and_visualize(image_path: str):
     cv2.waitKey(0)
 
     # --- 第二部分：高质量显示校正后的图像 ---
-    win2_name = "2. Dewarped Image (High Quality Scaling)"
+    win2_name = "2. Unwarped Image (High Quality Scaling)"
     cv2.namedWindow(win2_name, cv2.WINDOW_AUTOSIZE)  # 同样改为 AUTOSIZE
 
-    img_h, img_w = dewarped_image.shape
+    img_h, img_w = unwarped_image.shape
     # 使用与上面相同的缩放逻辑
     scale = min(screen_w / img_w, screen_h / img_h) * 0.8
 
     if scale < 1.0:
         new_w, new_h = int(img_w * scale), int(img_h * scale)
         # 再次使用 cv2.INTER_AREA 进行高质量缩放
-        display_img2 = cv2.resize(dewarped_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        display_img2 = cv2.resize(unwarped_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
     else:
-        display_img2 = dewarped_image
+        display_img2 = unwarped_image
 
     cv2.imshow(win2_name, display_img2)
+
+    # 第三部分 显示裁剪过后的处方区域
+    win3_name = "3. Cropped Prescription Region"
+    cv2.namedWindow(win3_name, cv2.WINDOW_AUTOSIZE)
+
+    img_h, img_w = prescription_region.shape
+    scale = min(screen_w / img_w, screen_h / img_h) * 0.8
+    if scale < 1.0:
+        new_w, new_h = int(img_w * scale), int(img_h * scale)
+        display_img3 = cv2.resize(prescription_region, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    else:
+        display_img3 = prescription_region
+
+    cv2.imshow(win3_name, display_img3)
+
     print("已显示校正结果。按任意键关闭所有窗口。")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
     cv2.imwrite(r'E:\FYP\TcmPrescriptionOcr\test\lines.png', image_with_lines)
-    cv2.imwrite(r'E:\FYP\TcmPrescriptionOcr\test\dewarped.png', dewarped_image)
+    cv2.imwrite(r'E:\FYP\TcmPrescriptionOcr\test\unwarped.png', unwarped_image)
 
 
-# ===================================================================
-#  程序入口
-# ===================================================================
+
+def main():
+    print("Starting unwarping conversion...")
+    print("Source directory:", GREYSCALE_DATA_DIR)
+    print("Target directory:", UNWARPED_DATA_DIR)
+    greyscale_paths = find_images_recursive(GREYSCALE_DATA_DIR)
+    if not greyscale_paths:
+        print(f'No images found in {GREYSCALE_DATA_DIR}. ')
+        return
+
+    for input_path in greyscale_paths:
+        try:
+            relative_path = os.path.relpath(input_path, GREYSCALE_DATA_DIR)
+            output_path = os.path.join(UNWARPED_DATA_DIR, relative_path)
+
+            output_dir = os.path.dirname(output_path)
+            os.makedirs(output_dir, exist_ok=True)
+
+            greyscale_image = cv2.imread(str(input_path), cv2.IMREAD_GRAYSCALE)
+
+            unwarped_image = unwarp(greyscale_image)
+            # prescription_region = crop_prescription_region(unwarped_image)
+
+            cv2.imwrite(str(output_path), unwarped_image)
+
+
+
+        except Exception as e:
+            print(f"Error processing {input_path}: {e}")
+
+    print("Unwarping conversion completed.")
+
+
 if __name__ == "__main__":
-    # 定义要处理的图片路径
-    TARGET_IMAGE_PATH = r'E:\FYP\TcmPrescriptionOcr\test\camera_uneven_lighting.png'
+    # # 定义要处理的图片路径
+    # TARGET_IMAGE_PATH = r'E:\FYP\TcmPrescriptionOcr\test\4.png'
+    #
+    # # 选项 2: 运行并可视化结果
+    # run_and_visualize(TARGET_IMAGE_PATH)
 
-    # 选项 2: 运行并可视化结果
-    run_and_visualize(TARGET_IMAGE_PATH)
+    main()

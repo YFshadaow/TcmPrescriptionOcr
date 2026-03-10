@@ -10,6 +10,8 @@ ORIGINAL_DATA_DIR = DATA_DIR / 'original'
 ALIGNED_DATA_DIR = DATA_DIR / 'aligned'
 # Directory to store greyscale prescription files
 GREYSCALE_DATA_DIR = DATA_DIR / 'greyscale'
+# Directory to store unwarped prescription files
+UNWARPED_DATA_DIR = DATA_DIR / 'unwarped'
 
 # Target image file format
 TARGET_IMAGE_FORMAT = '.png'
